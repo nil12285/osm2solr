@@ -33,6 +33,8 @@ class OSMParser
             $xmlDocString = "";
             echo 'Start time : ' . date('Y-m-d H:i:s') . "\n";
             $start_time = microtime();
+            $solrDocs = array();
+            
             while (($docLine = fgets($fp)) !== false) 
             {
             
@@ -55,21 +57,21 @@ class OSMParser
                         case 'node' :
                             $node = new Node($xmlDoc);                            
                             $this->parseNode($node);
-                            print 'node-'.$node->id . "\n";
+                            if($i % CHECK_POINT == 0) print 'node-'.$node->id . "\n";
                             $nodeCount++;
                         break;
                         
                         case 'way' :
                             $way = new Way($xmlDoc);
                             $this->parseWay($way);
-                            print 'way-'.$way->id . "\n";
+                            if($i % CHECK_POINT == 0) print 'way-'.$way->id . "\n";
                             $wayCount++;
                         break;
                         
                         case 'relation' :                            
                             $relation = new Relation($xmlDoc);
                             $this->parseRelation($relation);                            
-                            print 'relation-'.$relation->id . "\n";
+                            if($i % CHECK_POINT == 0) print 'relation-'.$relation->id . "\n";
                             $relationCount++;
                         break;
                     }
@@ -78,16 +80,21 @@ class OSMParser
                      * push document to solr
                      * @todo multiple document push;
                      **/
-                     try{
-                        $solrRes = $this->solr->addDocument($this->solrDoc);
-                     } catch(SolrClientException $e) {
-                        print "\n\n Error Fail to process: \n";
-                        print $e->getMessage();
-                        print "\n";
-                        print_r($this->solrDoc->toArray());
-                        print "\n---------------------\n\n\n";
-                        
-                     }
+                     
+                    $solrDocs[] = $this->solrDoc;
+                    if($i % CHECK_POINT == 0) {
+                        try{
+                            $solrRes = $this->solr->addDocuments($solrDocs);
+                            $solrDocs = array();
+                            print $solrRes->getHttpStatusMessage() . "\n";
+                            sleep(10);
+                        } catch(SolrClientException $e) {
+                            print "\n\n Error Fail to process: \n";
+                            print $e->getMessage();
+                            print "\n";
+                            print "\n---------------------\n\n\n";
+                        }
+                    }
                 }
                 
                 $i++;
@@ -98,6 +105,8 @@ class OSMParser
                     if($wayCount > 0) print 'Way Processed : ' . $wayCount . "\n";
                     if($relationCount > 0) print 'Relation Processed : ' . $relationCount . "\n";
                     
+                    print "Offset : ". ftell($fp);
+                    print "\n\n";
                 }
             }
             
@@ -130,7 +139,7 @@ class OSMParser
          * also keep a cache of all nodes and locations
          * as we don't able to store these many locations in memory lets push it to Solr with location-{node_id}'
          **/
-        $this->pushNodeLocationInfo($osmNode);
+        //$this->pushNodeLocationInfo($osmNode);
         
         #loop over tags        
         if($osmNode->tags) $standAloneNode = $this->parseTags($osmNode->tags);
@@ -197,6 +206,7 @@ class OSMParser
             if($tag->k == 'addr:street') $street                    = (string) $tag->v;
             if($tag->k == 'addr:city') $city                        = (string) $tag->v;
             if($tag->k == 'addr:postcode') $postcode                = (string) $tag->v;
+            
             if($tag->k == 'addr:housenumber') $housenumber          = (string) $tag->v;
     	}
         
@@ -257,7 +267,7 @@ class OSMParser
             $nodes = array();
             
         	foreach ($way->nds as $nd)
-                $nodes[] = 'location-'.(string)$nd->ref;
+                $nodes[] = 'node-'.(string)$nd->ref;
             
             $nodelocations = $this->getDocumentsByIds($nodes);
             
@@ -334,21 +344,36 @@ class OSMParser
              * @todo find center point of relations
              * possible values [default,east,west,north,south]
              **/
-            if($relations['default']) {
-                //littlebit easy
-            } else {
-                //i don't know how am i gonna do this                
-            }
+            $relationLocations = $this->getLocationsOfRelations($relations);
             
-            $location['corners'] = array();
-            $location['location']['lat'] = 0;
-            $location['location']['lon'] = 0;
+            if($relationLocations)
+                $location = $this->getCenterPoint($waylocations);
+            else {
+                $location['corners'] = array();
+                $location['location']['lat'] = 0;
+                $location['location']['lon'] = 0;
+            }
         }
         
         $this->solrDoc->addField('location', $location['location']['lat'].','.$location['location']['lon']);
         
         if($location['corners'])
             $this->solrDoc->addField('corners',json_encode($location['corners']));
+    }
+    
+    
+    
+    
+    private function getLocationsOfRelations(&$relations)
+    {
+        $relRef = array();
+        foreach($relations as $k=>$role) {
+            foreach($role as $k=>$relation) {
+                $relRef[] = $relation;
+            }
+        }
+        
+        return $this->getDocumentsByIds($relRef);
     }
     
     
@@ -363,9 +388,9 @@ class OSMParser
         
         foreach($locations as $k=>$location) {
             $counter++;
-            $corners[] = array('lat'=>$location->latitude,'lon'=>$location->longitude);
-    		$lat = (double) $lat + (double) $location->latitude;
-    		$lon = (double) $lon + (double) $location->longitude;
+            $corners[] = array('lat'=>$location->location_0_coordinate,'lon'=>$location->location_1_coordinate);
+    		$lat = (double) $lat + (double) $location->location_0_coordinate;
+    		$lon = (double) $lon + (double) $location->location_1_coordinate;
         }
             
         $locLat = (double) ($lat / $counter);
@@ -401,7 +426,7 @@ class OSMParser
     {
         if(count($ids) > 1) {
             if(count($ids) > 300)
-                $ids = array_slice($ids, 0, 300);
+                $ids = array_slice($ids, 0, 500);
             
             $inString = '("'.implode("\",\"",$ids).'")';
             
